@@ -1,0 +1,144 @@
+Análisis del Launcher Retrac-v3
+1. Stack tecnológico
+Capa	Tecnología	Detalle
+Shell nativa	Tauri 2.5 (Rust, no Electron)	src-tauri\tauri.conf.json — identificador launcher.retrac.site, ventana sin decoraciones (decorations: false), 936x600
+Frontend	React 18 + TypeScript 5.6 + Vite 6	package.json, entry en src\main.tsx
+Router	@tanstack/react-router (no React Router)	src\components\router.tsx
+Estado	Zustand 5 con middleware persist sobre localStorage	src\wrapper\*.ts
+CSS	Tailwind CSS 4 (plugin @tailwindcss/vite) + clases custom (glass, --ACCENT emerald #10b981)	src\main.css
+Animaciones	Motion (Framer Motion v12) — motion/react: springs, AnimatePresence, Reorder	src\import\ui.tsx, src\components\core\default.tsx
+Otros	axios, @number-flow/react (contadores animados), react-icons/io5, react-markdown, @mui/x-charts (declarado), plugins Tauri: deep-link, dialog, opener, process, updater, single-instance	
+Backend Rust	tokio, reqwest (streaming), async-compression (gzip), winapi (CreateProcessW, ShellExecuteW), sysinfo, md-5, winver, regex	src-tauri\Cargo.toml
+Nota: MUI/Emotion y axios están en dependencias pero la UI real es Tailwind puro; MUI no se usa en los componentes actuales.
+
+2. Estructura de carpetas/archivos
+
+text
+Retrac-v3\
+├── index.html, vite.config.ts, tsconfig*.json, package.json, yarn.lock, build.sh, README.md
+├── public\                          (assets estáticos: bg1/bg2.jpg, fuentes Geist/BinancePlex/Inter, iconos de packs en donate\, vbuck.png, retrac_banner.png)
+├── src\
+│   ├── main.tsx                     entry React (Bootstrap + UpdateChecker + TauriListeners + RouterProvider)
+│   ├── main.css                     tema, fuentes, glass, scrollbar
+│   ├── retrac.d.ts                  tipos globales (User, LibraryEntry, BackendServer, LaunchOptions, ManifestProgress...)
+│   ├── axios\client.ts              cliente HTTP al backend (retrac.site / localhost:3000 en dev)
+│   ├── tauri\index.ts               wrapper tipado de invoke + invoke.d.ts (tipos de eventos)
+│   ├── socket\
+│   │   ├── index.ts                 store Zustand del WebSocket + bind/unbind/send
+│   │   ├── handler.ts              clase RetracSocket (reconnect auto, logout en código 1006)
+│   │   ├── export.ts               exchange_code() (pide "code" al server)
+│   │   ├── event_up.d.ts / event_down.d.ts   protocolo tipado
+│   ├── wrapper\                     stores Zustand:
+│   │   ├── user.ts                  token, User, etapa de login, tiers de donante
+│   │   ├── library.ts              builds instalados + launchBuild()
+│   │   ├── options.ts              opciones de usuario (persistidas)
+│   │   ├── retrac.ts               news/events/manifests + flags dev
+│   │   ├── tauri.ts                info de app/versión/dev
+│   │   ├── download.ts, server.ts, friends.ts, leaderboard.ts, banner.ts, hover.ts
+│   ├── components\
+│   │   ├── router.tsx              árbol de rutas
+│   │   ├── core\                   bootstrap.tsx, frame.tsx, listeners.tsx, update.tsx, account.tsx, hover.tsx, option.tsx (738 líneas de options UI), default.tsx (kit UI)
+│   │   ├── navigation\             drawer.tsx, friends.tsx
+│   │   ├── banner\                 banner.tsx, parent.tsx (notificaciones tipo toast)
+│   │   └── routes\
+│   │       ├── login\page.tsx, update\page.tsx, dev\page.tsx
+│   │       └── app\                index.tsx (guard), home\ (+9 widgets), library\, downloads\, settings\, status\ (servers/matches), store\, leaderboard\, competitive\, clans\, editor\, external\
+│   └── import\ui.tsx               namespace SimpleUI (Drawer, FallingElements/partículas)
+└── src-tauri\
+    ├── tauri.conf.json, Cargo.toml, capabilities\default.json + desktop.json
+    └── src\
+        ├── main.rs, lib.rs          (registro de plugins y comandos)
+        └── modules\                 mod.rs, commands.rs (comandos Tauri), launch.rs (lógica de lanzamiento), chunker.rs (downloader por chunks), process.rs (CreateProcessW), admin.rs (elevación PowerShell), util.rs (singletons/globales)
+3. Inicio de sesión
+Backend externo propio en https://retrac.site (en dev: http://localhost:3000), definido en src\axios\client.ts. No hay login con usuario/contraseña local: es OAuth de Discord + deep link.
+
+GET https://retrac.site/retrac/discord?v=2 devuelve la URL de OAuth de Discord → se abre en el navegador con openUrl() (src\components\routes\login\page.tsx, función handleAuthenticate).
+Discord redirige al esquema retrac://token@<TOKEN> registrado por tauri-plugin-deep-link (schemes en tauri.conf.json, registro en lib.rs línea 37: app.deep_link().register("retrac")).
+deeplink.onOpenUrl captura el token, userManager.login(token) y navega a /app/home (login page, onNewToken).
+El token se guarda en localStorage bajo la clave "token" (src\wrapper\user.ts, partialize: (s) => ({ _token: s._token })).
+src\components\core\bootstrap.tsx (socketConnect) conecta un WebSocket: ws(s)://<hostname>/launcher/ws?token=<base64(token)> y pide request_user; el servidor responde con el evento user que contiene el objeto User completo (DisplayName, Discord avatar, Stats, Packages/tiers de donación, Friendships, Profiles athena/common_core — tipos en src\retrac.d.ts).
+Estados de sesión (LauncherStage en user.ts): NoToken → TestingToken → AllGood. El guard de rutas (frame.tsx + app\index.tsx) redirige a / si no hay sesión. Si el WS muere con código 1006 hace logout automático (socket\handler.ts líneas 56-59).
+
+Otros endpoints HTTP: GET /adverts con Authorization: <token> para el enlace LootLabs (client.get_lootlabs_offer_url). Todo lo demás (user, leaderboard, servers, OTP, exchange code, news, eventos) va por el WebSocket.
+
+4. Lanzamiento del juego (mecanismo central)
+Flujo completo en src\wrapper\library.ts → launchBuild(version, override_password) (líneas 199-262):
+
+Marca LAUNCH_STATE.LAUNCHING; si nunca se intentó, pide exclusión de Windows Defender vía comando add_to_defender (PowerShell elevado con ShellExecuteW verbo "runas", src-tauri\src\modules\admin.rs).
+Pide el exchange code por WebSocket: socketExport.exchange_code() (src\socket\export.ts) envía { id: "request_code" } y espera el evento down code (timeout 5 s).
+Llama invoke.launch_retrac(options) con el struct LaunchOptions (tipado espejo en src\tauri\invoke.d.ts): exchange_code, anticheat_token (el propio token de login), root, manifest_id, flags de gameplay, custom_dll_path, override_password.
+El lado Rust (src-tauri\src\modules\launch.rs) hace, en orden:
+
+Descargas previas por chunks (chunker.rs, CDN https://cdn.atromos... no: https://cdn.atmos.chat/manifest, manifiestos *.acidmanifest con archivos partidos en chunks gzip con hash MD5, paralelismo num_cpus/2): descarga Anticheat_Client (DLL que se copia a Engine\Binaries\ThirdParty\NVIDIA\NVaftermath\Win64\GFSDK_Aftermath_Lib.x64.dll) y EAC_Client; si es la build C2S4 (++Fortnite+Release-14.40-CL-14550713) también Custom_Content, Bubble_Builds/Mobile_Builds opcional.
+Instala el anti-cheat: ejecuta EasyAntiCheat\EasyAntiCheat_EOS_Setup.exe install b2504259773b40e3a818f820e31979ca (GUID fijo del producto EAC) si no estaba inicializado, y emite el evento Tauri EAC_INITIALISED.
+Mata procesos: FortniteClient-Win64-Shipping_BE/_EAC/.exe, EpicGamesLauncher.exe, FortniteLauncher.exe (sysinfo + Signal::Kill, process.rs::kill_all).
+Lanza en cascada con CreateProcessW (process.rs::start_internal, flags CREATE_SUSPENDED | DETACHED_PROCESS):
+FortniteGame\Binaries\Win64\FortniteLauncher.exe (suspendido),
+FortniteGame\Binaries\Win64\FortniteClient-Win64-Shipping_EAC.exe (suspendido),
+El binario real con argumentos — por defecto un Retrac_EAC.exe (wrapper en la raíz de la instalación que probablemente inyecta/carga el cliente propio antes de arrancar el juego), o directamente FortniteClient-Win64-Shipping.exe si el usuario configura una DLL custom (custom_dll_path), que se copia sobre GFSDK_Aftermath_Lib.x64.dll (técnica clásica de DLL hijacking/sustitución de la DLL de NVIDIA para inyectar el cliente de Retrac).
+Argumentos de línea de comandos (idénticos en ambas ramas, launch.rs líneas 116-157):
+
+
+rust
+"-epicapp=Fortnite", "-epiclocale=en-us", "-epicportal", "-nobe",
+"-fromfl=eac", "-fltoken=hchc0906bb1bg83c3934fa31",
+"-caldera=<JWT firmado ES256 con accountId fijo be9da5c2... / acProvider EasyAntiCheat>",
+"-skippatchcheck", "-noeac",
+"-AUTH_LOGIN=retrac@."        (o "<displayname>@." con override)
+"-AUTH_TYPE=exchangecode"     (o "epic" con override)
+"-AUTH_PASSWORD=<exchange_code>"   (o el nombre de usuario como password con override)
+"-actoken=<anticheat_token>",  // el token del launcher
+<launch_args personalizados del usuario>,
+"-simpleedit" / "-disablepreedit" / "-instantreset"  (según opciones)
+No usa servidor local ni puerto local: el juego se autentica contra el backend de Retrac mediante el exchange code entregado por el WS (el backend valida el token del launcher y emite el code), y -actoken lleva el token como anticheat/auth. El modo override_password (página Developer) salta el exchange code y hace login tipo epic con nombre custom — permite lanzar dos instancias para pruebas.
+
+Detección de versión instalada: commands.rs::get_fortnite_version busca un patrón de bytes UTF-16LE (++Fortnite+Release) dentro del binario FortniteClient-Win64-Shipping.exe y extrae ++Fortnite+Release-X.Y-CL-N con regex (util.rs::find_fortnite_release).
+
+5. Configuración persistente
+Todo con Zustand + persist sobre localStorage (no archivos), en 3 stores persistidos:
+
+src\wrapper\user.ts — clave "token": solo _token.
+src\wrapper\library.ts — clave "library": array de LibraryEntry (rootLocation, processLocation, splashLocation, version, buildName, manifestId, flags de EAC/Defender). En producción launch_args se envía vacío (solo en dev se usan los launch_arguments de opciones).
+src\wrapper\options.ts — clave "options": content_directory, simple_edit, disable_pre_edits, reset_on_release, bubble/mobile_builds, tema (custom_theme_colour, background_image/blur/gradient, launcher_scale, nieve navideña + densidad de partículas), etc.
+src\wrapper\retrac.ts — clave "retrac": parcial (do_not_download_paks, use_custom_dll_path, custom_dll_path, show_all_widgets, enable_override_password, override_password).
+Los datos vivos (news, eventos, servidores, progreso de descarga, banners) son stores no persistidos.
+
+6. Pantallas y flujo de usuario
+Rutas (src\components\router.tsx): / (login), /update, /developer, /app/* protegido.
+
+Frame raíz (core\frame.tsx): barra de título custom (minimizar/cerrar, drag region), Drawer lateral, gestor de banners, lista de amigos a la derecha, nieve estacional (1-31 dic), fondo configurable con blur.
+Login (routes\login\page.tsx): tarjeta glass con botón "Connect with Discord".
+Home (routes\app\home\page.tsx): widgets de personaje/locker (character.tsx), estadísticas con gráficas (statistics.tsx), FortniteWidget (hero con vídeo de fondo cdn.retrac.site/.../RetracSeason14Card.mp4 y botones Download/Launch con estados), LootLabs (anuncio de V-Bucks cada 24 h vía /adverts), noticias (con modal markdown), eventos/torneos, donaciones.
+Downloads (routes\app\downloads\page.tsx): tarjetas por manifest con verificación de archivos en vivo (downloading.tsx con velocidad/ETA/progreso desde eventos DOWNLOAD_PROGRESS), entrada con estados "Verifying Content n/m", "Installed".
+Library: lista reordenable con drag (Reorder de motion) o grid; por build: añadir a Defender, lanzar/cerrar, borrar.
+Status/Matches: servidores en vivo por región con filtros y estado de partida (server_created/updated/deleted push por WS).
+Settings (settings\page.tsx): grupos de opciones (Network, Gameplay Tweaks, Client Preferences — tema/escala/solo donantes), cuenta con cambio de display name, logout.
+Store/Donate (store\page.tsx): paquetes de donación con tiers (DONATION_TIERS en user.ts), efectos visuales en store\effect.tsx.
+External Device Auth (external\page.tsx): credenciales <nombre>@re.trac + OTP en vivo (suscripción otp_subscribe por WS) para consolas/móvil.
+Update (update\page.tsx): descarga e instala la actualización del propio launcher (plugin-updater, endpoint https://retrac.site/retrac/query_tauri_update/{{current_version}}, firmado con minisign; actualmente desactivado en core\update.tsx para el desarrollo 2.1.2).
+Developer (dev\page.tsx): override del backend (override_client_url), DLL custom, login con nombre custom, "Launch two instances", ejemplos de UI.
+Polling global cada 3 s de is_fortnite_running para sincronizar LAUNCH_STATE (bootstrap.tsx líneas 277-305); auto-descarga de contenido extra cada 5 min (listeners.tsx).
+
+7. Componentes UI reutilizables destacados
+src\import\ui.tsx (SimpleUI): Drawer animado con spring (84px colapsado / 280px expandido, items con notificaciones NumberFlow), FallingElements/FallingElementContainer: sistema de partículas cayendo (nieve, V-Bucks) con motion — posición/duración/rotación aleatoria, repeat infinito, backdrop-blur.
+src\components\core\default.tsx (UI): Button con 7 esquemas de color y loadAfterClick (spinner auto), LoadingSpinner (3 puntos con motion), RowButton con tooltip animado (AnimatePresence), MinDuration (mantiene elementos visibles un mínimo de tiempo), Box/RowBox/ColBox, H1/P.
+src\components\core\option.tsx (738 líneas): OptionGroup, BooleanOption, StringOption, FileOption, SliderOption, ColourOption — framework declarativo de settings con iconos y esquemas de color.
+Banners (banner\banner.tsx + wrapper\banner.ts): sistema de notificaciones con prioridad por id, colores y expiración, usado incluso para errores de invoke (el wrapper src\tauri\index.ts muestra banner rojo en cada fallo).
+Clases CSS .glass (backdrop-blur 12px, borde blanco 5%), scrollbar fina premium, variables --ACCENT emerald, fuentes Inter/Geist/BinancePlex.
+Guards y redirect centralizados en frame.tsx con LoadingIndicator mientras el token se valida.
+8. Backend Rust/Tauri (detalle)
+Comandos registrados en src-tauri\src\lib.rs (generate_handler!), todos Windows-only salvo utilidades:
+
+Comando	Función
+get_windows_version	WindowsVersion::detect().build
+get_fortnite_version(path)	busca patrón UTF-16 en el exe y extrae la versión
+launch_retrac(options)	pipeline completo de lanzamiento (ver sección 4)
+download_build / delete_build / cancel_download	chunker sobre https://cdn.atmos.chat/manifest/<id>.acidmanifest + chunks <CDN>/<manifest>/<hash>
+is_fortnite_running / close_fortnite	sysinfo
+add_to_defender	PowerShell Add-MpPreference -ExclusionPath elevado con ShellExecuteW "runas", salida vía archivo temporal %APPDATA%\out
+get_app_action	acción pasada por CLI -action_after=launch_build:<version> (permite lanzar builds desde atajos/deep links)
+Eventos emitidos Rust → frontend (emit): DOWNLOAD_PROGRESS, VERIFY_PROGRESS, VERIFYING, BUILD_ALREADY_INSTALLED, BUILD_DELETED, DOWNLOAD_ERROR2, EAC_INITIALISED — consumidos en src\components\core\listeners.tsx.
+
+No hay inyector DLL escrito en Rust: la "inyección" se resuelve sustituyendo la DLL GFSDK_Aftermath_Lib.x64.dll (descargada del CDN como manifest Anticheat_Client, o copiada desde custom_dll_path) y arrancando Retrac_EAC.exe en lugar del binario shipping estándar; los procesos FortniteLauncher.exe y FortniteClient-Win64-Shipping_EAC.exe se dejan creados pero suspendidos (CREATE_SUSPENDED) para que el flujo de EAC quede inicializado sin llegar a ejecutar el juego oficial.
+
+Observaciones de seguridad/robustez: el JWT -caldera y el -fltoken están hardcodeados en launch.rs; el token de sesión viaja en query string del WS (base64, no cifrado); CSP a null y assetProtocol con scope **/**; el commando add_to_defender_multi es un stub que devuelve Ok(true) sin hacer nada a pesar de que el frontend le pasa paths.
